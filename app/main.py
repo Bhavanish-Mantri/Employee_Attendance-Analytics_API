@@ -485,3 +485,160 @@ def list_attendance(
     }
 
 
+@app.patch("/attendance/{emp_code}/{date}", status_code=200)
+def regularize_attendance(
+    emp_code: str = Path(...),
+    date: str = Path(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$"),
+    body: RegularizeRequest = ...,
+):
+    """
+    Regularize one day's record: recompute derived fields, append audit trail to history.
+    Addresses record by (emp_code, date).
+    """
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    record = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
+    if not record:
+        raise HTTPException(status_code=404, detail="Attendance record not found for this date")
+
+    # Determine requested vs existing status
+    target_status = body.status if body.status is not None else record["status"]
+
+    # Rule: setting status ABSENT or LEAVE clears both punch times; supplying punch_in or punch_out is 422
+    if body.status in ("ABSENT", "LEAVE"):
+        if body.punch_in is not None or body.punch_out is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="punch_in and punch_out cannot be supplied when regularizing to ABSENT or LEAVE",
+            )
+        target_in_dt = None
+        target_out_dt = None
+    elif target_status in ("ABSENT", "LEAVE"):
+        # Existing status was ABSENT/LEAVE and not changed by request
+        if body.punch_in is not None or body.punch_out is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="punch times cannot be set while status is ABSENT or LEAVE",
+            )
+        target_in_dt = None
+        target_out_dt = None
+    else:
+        # Presence status
+        if body.punch_in is not None:
+            target_in_dt = epoch_ms_to_utc_dt(body.punch_in)
+        else:
+            target_in_dt = record.get("punch_in")
+            if target_in_dt and target_in_dt.tzinfo is None:
+                target_in_dt = target_in_dt.replace(tzinfo=timezone.utc)
+
+        if not target_in_dt:
+            raise HTTPException(status_code=422, detail="A presence status requires punch_in")
+
+        if body.punch_out is not None:
+            target_out_dt = epoch_ms_to_utc_dt(body.punch_out)
+        else:
+            target_out_dt = record.get("punch_out")
+            if target_out_dt and target_out_dt.tzinfo is None:
+                target_out_dt = target_out_dt.replace(tzinfo=timezone.utc)
+
+        # Rule: punch_in must stay on the record's attendance date (R1)
+        calc_date = determine_attendance_date(target_in_dt, emp["shift_start"], emp["shift_end"])
+        if calc_date != date:
+            raise HTTPException(
+                status_code=422,
+                detail=f"punch_in belongs to attendance date {calc_date}, but this record is for {date}",
+            )
+
+        # Rule: punch_out must be after punch_in and within 24 hours
+        if target_out_dt is not None:
+            diff_sec = (target_out_dt - target_in_dt).total_seconds()
+            if diff_sec <= 0 or diff_sec > 24 * 3600:
+                raise HTTPException(
+                    status_code=422,
+                    detail="punch_out must be strictly greater than punch_in and within 24 hours",
+                )
+
+    # Recompute derived fields based on final state
+    if target_status in ("ABSENT", "LEAVE"):
+        new_work_hours = None
+        new_late_minutes = 0
+        new_overtime_minutes = 0
+        new_half_day = False
+    else:
+        new_late_minutes = compute_late_minutes(target_in_dt, emp["shift_start"], date)
+        if target_out_dt is not None:
+            new_work_hours = compute_work_hours(target_in_dt, target_out_dt)
+            new_overtime_minutes = compute_overtime(target_out_dt, emp["shift_start"], emp["shift_end"], date)
+            new_half_day = compute_half_day(new_work_hours)
+        else:
+            new_work_hours = None
+            new_overtime_minutes = 0
+            new_half_day = False
+
+    # Detect actual changes
+    changes = {}
+
+    def check_diff(field_name: str, old_val: Any, new_val: Any):
+        if old_val != new_val:
+            changes[field_name] = {"from": old_val, "to": new_val}
+
+    check_diff("status", record.get("status"), target_status)
+    check_diff("punch_in", record.get("punch_in"), target_in_dt)
+    check_diff("punch_out", record.get("punch_out"), target_out_dt)
+    check_diff("work_hours", record.get("work_hours"), new_work_hours)
+    check_diff("late_minutes", record.get("late_minutes", 0), new_late_minutes)
+    check_diff("overtime_minutes", record.get("overtime_minutes", 0), new_overtime_minutes)
+    check_diff("half_day", record.get("half_day", False), new_half_day)
+
+    if not changes:
+        raise HTTPException(status_code=422, detail="Request resulted in no changes to the record")
+
+    # Audit history entry
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    history_entry = {
+        "at": now_utc,
+        "by": body.regularized_by,
+        "reason": body.reason,
+        "changes": changes,
+    }
+
+    set_doc = {
+        "status": target_status,
+        "punch_in": target_in_dt,
+        "punch_out": target_out_dt,
+        "work_hours": new_work_hours,
+        "late_minutes": new_late_minutes,
+        "overtime_minutes": new_overtime_minutes,
+        "half_day": new_half_day,
+    }
+
+    # Optimistic concurrency: ensure document fields and history have not changed concurrently
+    current_history = record.get("history")
+    query_condition: Dict[str, Any] = {
+        "_id": record["_id"],
+        "status": record.get("status"),
+        "punch_in": record.get("punch_in"),
+        "punch_out": record.get("punch_out"),
+    }
+    if current_history is None:
+        query_condition["history"] = {"$in": [None, []]}
+    else:
+        query_condition["history"] = current_history
+
+    res = db.attendance_logs.find_one_and_update(
+        query_condition,
+        {
+            "$set": set_doc,
+            "$push": {"history": history_entry},
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+
+    if not res:
+        raise HTTPException(status_code=409, detail="Concurrent regularization conflict")
+
+    return serialize_attendance_doc(res)
+
+
