@@ -299,3 +299,189 @@ def health():
         raise HTTPException(status_code=503, detail="Database unavailable")
 
 
+@app.post("/employees", status_code=201)
+def create_employee(body: EmployeeCreate):
+    """Creates an employee. Unique emp_code enforced by database index."""
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    doc = {
+        "emp_code": body.emp_code,
+        "name": body.name,
+        "email": body.email,
+        "department": body.department,
+        "shift_start": body.shift_start,
+        "shift_end": body.shift_end,
+        "joined_on": body.joined_on,
+        "created_at": now_utc,
+    }
+    try:
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(status_code=409, detail="emp_code already exists")
+
+    return serialize_employee_doc(doc)
+
+
+@app.get("/employees", status_code=200)
+def list_employees(
+    department: Optional[str] = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    """List employees sorted by emp_code ascending."""
+    query = {}
+    if department is not None:
+        query["department"] = department
+
+    total = db.employees.count_documents(query)
+    skip = (page - 1) * page_size
+    cursor = db.employees.find(query).sort("emp_code", ASCENDING).skip(skip).limit(page_size)
+    items = [serialize_employee_doc(doc) for doc in cursor]
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+@app.post("/attendance/punch-in", status_code=201)
+def punch_in(body: PunchInRequest):
+    """Creates the day's attendance record. Concurrency race-safe via unique index."""
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    if body.punched_at is not None:
+        p_dt = epoch_ms_to_utc_dt(body.punched_at)
+    else:
+        p_dt = datetime.now(timezone.utc).replace(microsecond=0)
+
+    att_date = determine_attendance_date(p_dt, emp["shift_start"], emp["shift_end"])
+    late_min = compute_late_minutes(p_dt, emp["shift_start"], att_date)
+
+    doc = {
+        "emp_code": body.emp_code,
+        "date": att_date,
+        "status": body.status,
+        "punch_in": p_dt,
+        "punch_out": None,
+        "work_hours": None,
+        "late_minutes": late_min,
+        "overtime_minutes": 0,
+        "half_day": False,
+        "history": [],
+    }
+
+    try:
+        db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(status_code=409, detail="Already punched in for this attendance date")
+
+    return serialize_attendance_doc(doc)
+
+
+@app.post("/attendance/punch-out", status_code=200)
+def punch_out(body: PunchOutRequest):
+    """
+    Closes the employee's most recent record whose punch_in <= punched_at.
+    Computes work_hours, overtime_minutes, and half_day.
+    Two simultaneous punch-outs yield exactly one 200 and the other 409.
+    """
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    if body.punched_at is not None:
+        p_out_dt = epoch_ms_to_utc_dt(body.punched_at)
+    else:
+        p_out_dt = datetime.now(timezone.utc).replace(microsecond=0)
+
+    # Find the most recent record whose punch_in <= p_out_dt
+    record = db.attendance_logs.find_one(
+        {"emp_code": body.emp_code, "punch_in": {"$lte": p_out_dt}},
+        sort=[("punch_in", DESCENDING)],
+    )
+    if not record:
+        raise HTTPException(status_code=404, detail="No punch-in record found for punch-out")
+
+    if record.get("punch_out") is not None:
+        raise HTTPException(status_code=409, detail="Record is already punched out")
+
+    p_in_dt = record["punch_in"]
+    if p_in_dt.tzinfo is None:
+        p_in_dt = p_in_dt.replace(tzinfo=timezone.utc)
+
+    # Validation: punched_at <= punch_in or > 24 hours after it -> 422
+    diff_sec = (p_out_dt - p_in_dt).total_seconds()
+    if diff_sec <= 0 or diff_sec > 24 * 3600:
+        raise HTTPException(
+            status_code=422,
+            detail="punch_out must be strictly greater than punch_in and within 24 hours",
+        )
+
+    # Compute derived values
+    w_hours = compute_work_hours(p_in_dt, p_out_dt)
+    ot_mins = compute_overtime(p_out_dt, emp["shift_start"], emp["shift_end"], record["date"])
+    h_day = compute_half_day(w_hours)
+
+    # Atomic update ensuring only an un-punched record is updated
+    updated = db.attendance_logs.find_one_and_update(
+        {"_id": record["_id"], "punch_out": None},
+        {
+            "$set": {
+                "punch_out": p_out_dt,
+                "work_hours": w_hours,
+                "overtime_minutes": ot_mins,
+                "half_day": h_day,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+
+    if not updated:
+        raise HTTPException(status_code=409, detail="Record is already punched out by concurrent request")
+
+    return serialize_attendance_doc(updated)
+
+
+@app.get("/attendance", status_code=200)
+def list_attendance(
+    emp_code: Optional[str] = None,
+    date_from: Optional[str] = Query(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$"),
+    date_to: Optional[str] = Query(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$"),
+    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    """
+    List attendance records sorted by date descending, then emp_code ascending.
+    Fast on 100k docs; server-side sorting and pagination.
+    """
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(status_code=422, detail="date_from cannot be greater than date_to")
+
+    query: Dict[str, Any] = {}
+    if emp_code:
+        query["emp_code"] = emp_code
+    if date_from or date_to:
+        query["date"] = {}
+        if date_from:
+            query["date"]["$gte"] = date_from
+        if date_to:
+            query["date"]["$lte"] = date_to
+    if status:
+        query["status"] = status
+
+    total = db.attendance_logs.count_documents(query)
+    skip = (page - 1) * page_size
+    cursor = db.attendance_logs.find(query).sort([("date", DESCENDING), ("emp_code", ASCENDING)]).skip(skip).limit(page_size)
+    items = [serialize_attendance_doc(doc) for doc in cursor]
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
